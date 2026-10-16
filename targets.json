@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "targets": [
+    {
+      "id": "gsi-arm64-vanilla",
+      "name": "ARM64 GSI — 不含 Google 服务",
+      "product": "lineage_gsi_arkui_arm64",
+      "kind": "gsi",
+      "architecture": "arm64",
+      "flavor": "vanilla",
+      "out_dir": "out/arkui-gsi",
+      "required_paths": [
+        "vendor/lineage/build/target/product/lineage_gsi_arkui_arm64.mk"
+      ]
+    },
+    {
+      "id": "gsi-arm64-gms",
+      "name": "ARM64 GSI — 包含 Google 服务",
+      "product": "lineage_gsi_arkui_gms_arm64",
+      "kind": "gsi",
+      "architecture": "arm64",
+      "flavor": "gms",
+      "out_dir": "out/arkui-gsi-gms",
+      "required_paths": [
+        "vendor/lineage/build/target/product/lineage_gsi_arkui_gms_arm64.mk",
+        "vendor/gapps/arm64/arm64-vendor.mk"
+      ],
+      "dependencies": [
+        {
+          "path": "vendor/gapps",
+          "repository": "MindTheGapps/vendor_gapps",
+          "revision": "39bd3a09640efb81234cdbd8ab98ab71541d5d46"
+        }
+      ]
+    }
+  ]
+}
