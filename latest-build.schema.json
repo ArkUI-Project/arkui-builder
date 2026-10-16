@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArkUI latest numeric build number response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["build_number"],
+  "properties": {
+    "build_number": {
+      "type": ["string", "null"],
+      "pattern": "^(?:0|[1-9][0-9]{0,63})$"
+    }
+  }
+}

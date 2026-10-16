@@ -24,6 +24,10 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
+from urllib.error import URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -52,9 +56,12 @@ class BuildError(Exception):
     pass
 
 
-RELEASE_TYPES = ("EXPERIMENTAL", "OFFICIAL", "RELEASE", "NIGHTLY", "SNAPSHOT", "UNOFFICIAL")
+RELEASE_TYPES = ("OFFICIAL", "UNOFFICIAL")
+RELEASE_CHANNELS = ("stable", "beta", "alpha")
 ROM_VERSION_PATTERN = r"[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.-]+)?"
 BUILD_NUMBER_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+DEFAULT_BUILD_NUMBER_API = "https://api.ark-ui.org/api/v2/builds/latest"
+MAX_CHANNEL_NUMBER = 2147483647
 
 
 def utc_now():
@@ -188,65 +195,294 @@ def valid_build_number(value):
     return re.fullmatch(BUILD_NUMBER_PATTERN, value) and not value.startswith("eng.")
 
 
-def configure_release(source, selected, args):
-    def ask(prompt):
-        try:
-            return input(prompt)
-        except EOFError as error:
-            raise BuildError("未收到编译确认，已取消") from error
+def channel_label(channel, number):
+    if channel is None:
+        return "None"
+    if channel == "stable":
+        return "Stable"
+    return channel.capitalize() + str(number)
 
+
+def build_name(args):
+    return f"ArkUI-{args.rom_version}-{args.release_type}-{channel_label(args.channel, args.channel_number)}-{args.build_number}"
+
+
+def validate_release(args):
+    if args.release_type not in RELEASE_TYPES:
+        raise BuildError("发行类型仅支持 OFFICIAL、UNOFFICIAL")
+    if args.release_type == "OFFICIAL":
+        if args.channel not in RELEASE_CHANNELS:
+            raise BuildError("官方更新渠道仅支持 stable、beta、alpha")
+        if args.channel == "stable":
+            if args.channel_number is not None:
+                raise BuildError("Stable 不使用渠道编号")
+        elif type(args.channel_number) is not int or not 1 <= args.channel_number <= MAX_CHANNEL_NUMBER:
+            raise BuildError(f"Beta/Alpha 编号应为 1–{MAX_CHANNEL_NUMBER} 的整数")
+    elif args.channel is not None or args.channel_number is not None:
+        raise BuildError("UNOFFICIAL 构建不能指定渠道或渠道编号")
+    if not re.fullmatch(ROM_VERSION_PATTERN, args.rom_version):
+        raise BuildError("ArkUI 版本无效，例如 1.0 或 1.0.1")
+    if not args.build_number or not valid_build_number(args.build_number):
+        raise BuildError("构建号限 1–64 位字母、数字、点、下划线或短横线，不能以 eng. 开头")
+    if args.jobs < 1:
+        raise BuildError("并行任务必须大于 0")
+
+
+def refresh_build_number(args):
+    latest = fetch_latest_build_number(args.build_number_api)
+    suggested = str(int(latest) + 1) if latest is not None else "1"
+    if not valid_build_number(suggested):
+        raise BuildError("远端构建号递增后超过 64 位，需手动指定")
+    args.build_number_lookup = {"latest": latest, "suggested": suggested, "queried_at": utc_now()}
+    return suggested
+
+
+def fetch_latest_build_number(url):
+    try:
+        parsed = urlsplit(url)
+    except ValueError as error:
+        raise BuildError("构建号查询接口 URL 无效") from error
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.fragment or re.search(r"[\x00-\x20\x7f]", url)):
+        raise BuildError("构建号查询接口必须为不含账号密码或片段的 HTTPS URL")
+
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, request, file, code, message, headers, new_url):
+            return None
+
+    request = Request(url, headers={
+        "Accept": "application/json", "Cache-Control": "no-cache", "User-Agent": "ArkUI-Builder"
+    })
+    try:
+        with build_opener(NoRedirect()).open(request, timeout=10) as response:
+            if response.status != 200:
+                raise BuildError(f"构建号接口返回 HTTP {response.status}")
+            body = response.read(4097)
+        if len(body) > 4096:
+            raise BuildError("构建号接口响应过大")
+        payload = json.loads(body)
+    except (URLError, OSError, ValueError) as error:
+        raise BuildError(f"无法读取远端构建号: {error}") from error
+    if not isinstance(payload, dict) or set(payload) != {"build_number"}:
+        raise BuildError("构建号接口必须返回仅包含 build_number 的 JSON 对象")
+    latest = payload["build_number"]
+    if latest is not None and (not isinstance(latest, str) or not re.fullmatch(r"0|[1-9][0-9]{0,63}", latest)):
+        raise BuildError("远端 build_number 必须为十进制整数字符串或 null")
+    return latest
+
+
+def configure_release(source, selected, args):
     default_version, lineage_version = source_versions(source)
-    if args.official and args.release_type not in (None, "OFFICIAL"):
-        raise BuildError("--official 与 --release-type 不一致")
-    release_type = args.release_type or ("OFFICIAL" if args.official else "EXPERIMENTAL")
-    rom_version = args.rom_version or default_version
-    build_number = args.build_number or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    interactive = sys.stdin.isatty() and not args.yes and not args.preview
-    if args.yes and not (args.rom_version and args.build_number and (args.release_type or args.official)):
-        raise BuildError("--yes 需要显式提供 --release-type、--rom-version 和 --build-number")
-    if not interactive and not args.yes and not args.preview:
+    if not args.interactive_configured and not args.yes and not args.preview:
         raise BuildError("编译前需要交互确认；自动化调用请提供完整版本参数和 --yes")
-    if interactive:
-        print("\n本次发行类型：")
-        for index, name in enumerate(RELEASE_TYPES, 1):
-            print(f"  {index}. {name}")
-        while True:
-            value = ask(f"发行类型 [{release_type}]: ").strip().upper() or release_type
-            if value.isdigit() and 1 <= int(value) <= len(RELEASE_TYPES):
-                value = RELEASE_TYPES[int(value) - 1]
-            if value in RELEASE_TYPES:
-                release_type = value
-                break
-            print("请输入列表中的编号或发行类型名称。")
-        while True:
-            value = ask(f"ArkUI 版本 ro.arkui.version [{rom_version}]: ").strip() or rom_version
-            if re.fullmatch(ROM_VERSION_PATTERN, value):
-                rom_version = value
-                break
-            print("版本格式示例：1.0、1.0.1、1.1.0-beta.1")
-        while True:
-            value = ask(f"构建号 ro.build.version.incremental [{build_number}]: ").strip() or build_number
-            if valid_build_number(value):
-                build_number = value
-                break
-            print("构建号限 1–64 位字母、数字、点、下划线或短横线，不能以 eng. 开头。")
-    if release_type not in RELEASE_TYPES or not re.fullmatch(ROM_VERSION_PATTERN, rom_version) or not valid_build_number(build_number):
-        raise BuildError("发行类型、ArkUI 版本或构建号无效")
-    args.release_type, args.rom_version, args.build_number = release_type, rom_version, build_number
+    if not args.interactive_configured:
+        if args.yes and not (args.rom_version and args.release_type):
+            raise BuildError("--yes 需要显式提供 --release-type 和 --rom-version")
+        if args.yes and args.release_type == "OFFICIAL" and not args.channel:
+            raise BuildError("OFFICIAL 自动化构建需要显式提供 --channel")
+        args.release_type = args.release_type or "OFFICIAL"
+        args.rom_version = args.rom_version or default_version
+        if args.release_type == "OFFICIAL":
+            args.channel = args.channel or "beta"
+            if args.channel in ("beta", "alpha"):
+                args.channel_number = args.channel_number if args.channel_number is not None else 1
+        print("\n正在查询远端最新构建号……", flush=True)
+        args.build_number_lookup = None
+        try:
+            suggested = refresh_build_number(args)
+            print(f"  自动构建号: {suggested}")
+            args.build_number = args.build_number or suggested
+        except BuildError as error:
+            if not args.build_number:
+                raise BuildError(f"{error}；请重试或通过 --build-number 手动指定") from error
+            print(f"  查询失败，采用手动构建号: {error}", file=sys.stderr)
+    validate_release(args)
     print("\n编译前确认：")
     print("  目标: " + ", ".join(target["name"] for target in selected))
-    print(f"  发行类型: {release_type}\n  ArkUI 版本: {rom_version}\n  构建号: {build_number}")
+    print(f"  发行名称: {build_name(args)}")
     print(f"  基础版本 org.arkui.build.version: {lineage_version}（由源码决定）")
     print(f"  编译类型: {args.variant}\n  并行任务: {args.jobs}")
     if args.preview:
         print("仅预览，未确认或启动编译。")
         return False
-    if interactive and ask("输入 yes 开始编译，直接回车取消: ").strip().lower() != "yes":
-        print("已取消编译。")
-        return False
-    args.confirmed_at = utc_now()
+    if not args.interactive_configured:
+        args.confirmed_at = utc_now()
     args.expected_lineage_version = lineage_version
     return True
+
+
+def interactive_configure(source, targets, args):
+    try:
+        import curses
+    except ImportError as error:
+        raise BuildError("当前 Python 缺少 curses，请使用 Ubuntu 的系统 Python 运行键盘菜单") from error
+
+    args.release_type = args.release_type or "OFFICIAL"
+    args.rom_version = args.rom_version or source_versions(source)[0]
+    if args.release_type == "OFFICIAL":
+        args.channel = args.channel or "beta"
+        if args.channel != "stable" and args.channel_number is None:
+            args.channel_number = 1
+    chosen = set(selection(args.select, len(targets))) if args.select else {0}
+    args.build_number_lookup = None
+
+    def run(screen):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        screen.keypad(True)
+        status = ""
+
+        def put(y, text, selected=False):
+            height, width = screen.getmaxyx()
+            if y < 0 or y >= height - 1:
+                return
+            result, cells = "", 0
+            for char in str(text):
+                cells += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+                if cells > width - 3:
+                    break
+                result += char
+            screen.addstr(y, 1, result, curses.A_REVERSE if selected else curses.A_NORMAL)
+
+        def draw(lines, active=0, footer="↑↓ 移动  ←→ 调整  Enter 编辑/确认  Esc 返回"):
+            screen.erase()
+            put(0, "ArkUI 编译工具")
+            height, _ = screen.getmaxyx()
+            visible = max(1, height - 7)
+            start = max(0, active - visible + 1)
+            for index, line in enumerate(lines[start:start + visible], start):
+                put(index - start + 2, line, index == active)
+            put(height - 4, status)
+            put(height - 2, footer)
+            screen.refresh()
+
+        def edit(title, value):
+            text = str(value or "")
+            while True:
+                draw([title, text + "▏"], 1, "输入新值；Backspace 删除；Ctrl+U 清空；Enter 保存；Esc 取消")
+                key = screen.get_wch()
+                if key in ("\n", "\r", curses.KEY_ENTER):
+                    return text.strip()
+                if key == "\x1b":
+                    return None
+                if key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+                    text = text[:-1]
+                elif key == "\x15":
+                    text = ""
+                elif isinstance(key, str) and key.isprintable():
+                    text += key
+
+        def pick_targets():
+            index = 0
+            while True:
+                lines = [f"[{'x' if i in chosen else ' '}] {t['name']}" +
+                         ("（缺少依赖）" if missing_paths(source, t) else "") for i, t in enumerate(targets)]
+                draw(lines, index, "↑↓ 移动；空格/←→ 多选；Enter 完成；Esc 返回")
+                key = screen.get_wch()
+                if key == curses.KEY_UP:
+                    index = (index - 1) % len(targets)
+                elif key == curses.KEY_DOWN:
+                    index = (index + 1) % len(targets)
+                elif key in (" ", curses.KEY_LEFT, curses.KEY_RIGHT):
+                    chosen.symmetric_difference_update({index})
+                elif key in ("\n", "\r", curses.KEY_ENTER, "\x1b"):
+                    return
+
+        def query_number(replace=False):
+            nonlocal status
+            status = "正在查询远端最新构建号……"
+            draw([status])
+            try:
+                number = refresh_build_number(args)
+                if replace or not args.build_number:
+                    args.build_number = number
+                status = f"远端最新：{args.build_number_lookup['latest']}；自动建议：{number}"
+            except BuildError as error:
+                status = f"查询失败，请编辑构建号：{error}"
+
+        query_number()
+        active = 0
+        while True:
+            rows = [("targets", f"编译目标：已选择 {len(chosen)} 项"),
+                    ("release_type", f"发行类型：{args.release_type}")]
+            if args.release_type == "OFFICIAL":
+                rows.append(("channel", f"更新渠道：{args.channel}"))
+                if args.channel != "stable":
+                    rows.append(("channel_number", f"渠道编号：{args.channel_number}"))
+            rows.extend([("rom_version", f"ArkUI 版本：{args.rom_version}"),
+                         ("build_number", f"构建号：{args.build_number or '请手动输入'}"),
+                         ("jobs", f"并行任务：{args.jobs}"), ("variant", f"编译类型：{args.variant}"),
+                         ("refresh", "刷新远端构建号并采用建议值"),
+                         ("prepare", "准备所选目标的依赖（不编译）"),
+                         ("start", "检查配置并开始编译"), ("cancel", "退出")])
+            active = min(active, len(rows) - 1)
+            draw([text for _, text in rows], active)
+            key = screen.get_wch()
+            if key in ("q", "\x1b"):
+                return None
+            if key in (curses.KEY_UP, curses.KEY_DOWN):
+                active = (active + (1 if key == curses.KEY_DOWN else -1)) % len(rows)
+                continue
+            field = rows[active][0]
+            enter = key in ("\n", "\r", curses.KEY_ENTER)
+            step = -1 if key == curses.KEY_LEFT else 1
+            if key not in (curses.KEY_LEFT, curses.KEY_RIGHT, " ") and not enter:
+                continue
+            if field == "targets":
+                pick_targets()
+            elif field in ("release_type", "channel", "variant"):
+                options = {"release_type": RELEASE_TYPES, "channel": RELEASE_CHANNELS,
+                           "variant": ("userdebug", "user", "eng")}[field]
+                setattr(args, field, options[(options.index(getattr(args, field)) + step) % len(options)])
+                if field == "release_type":
+                    args.channel = "beta" if args.release_type == "OFFICIAL" else None
+                if field in ("release_type", "channel"):
+                    args.channel_number = 1 if args.channel in ("beta", "alpha") else None
+            elif field in ("jobs", "channel_number") and not enter:
+                setattr(args, field, max(1, min(MAX_CHANNEL_NUMBER, getattr(args, field) + step)))
+            elif field in ("rom_version", "build_number", "jobs", "channel_number") and enter:
+                value = edit(rows[active][1].split("：")[0], getattr(args, field))
+                if value is not None:
+                    if field in ("jobs", "channel_number"):
+                        if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= MAX_CHANNEL_NUMBER:
+                            status = f"请输入 1–{MAX_CHANNEL_NUMBER} 的整数"
+                            continue
+                        value = int(value)
+                    setattr(args, field, value)
+            elif field == "refresh" and enter:
+                query_number(replace=True)
+            elif field in ("start", "prepare") and enter:
+                if not chosen:
+                    status = "请至少选择一个目标"
+                    continue
+                selected = [targets[i] for i in sorted(chosen)]
+                if field == "prepare":
+                    args.prepare_dependencies = True
+                    return selected
+                try:
+                    validate_release(args)
+                    for target in selected:
+                        if missing_paths(source, target):
+                            raise BuildError("所选目标缺少依赖，请先选择“准备依赖”")
+                except BuildError as error:
+                    status = str(error)
+                    continue
+                summary = [build_name(args), "目标：" + ", ".join(t["id"] for t in selected),
+                           f"类型：{args.variant}；并行任务：{args.jobs}", "Enter 确认开始；其他键返回修改"]
+                draw(summary)
+                if screen.get_wch() in ("\n", "\r", curses.KEY_ENTER):
+                    args.interactive_configured = True
+                    args.confirmed_at = utc_now()
+                    return selected
+            elif field == "cancel" and enter:
+                return None
+
+    try:
+        return curses.wrapper(run)
+    except curses.error as error:
+        raise BuildError("无法打开键盘菜单，请在支持交互的终端中运行，或使用参数进行自动化调用") from error
 
 
 def checked(command, **kwargs):
@@ -419,6 +655,12 @@ def package(source, stage, target, variables, env, args):
     props.update(read_properties(properties / "product.build.prop"))
     if props.get("org.arkui.releasetype") != env["LINEAGE_BUILDTYPE"]:
         raise BuildError("实际发行类型不符合选择")
+    if (props.get("org.arkui.channel") or None) != args.channel:
+        raise BuildError("实际更新渠道不符合选择")
+    if (props.get("org.arkui.channel.number") or None) != (
+        str(args.channel_number) if args.channel_number is not None else None
+    ):
+        raise BuildError("实际渠道编号不符合选择")
     for key, expected_value in {
         "ro.arkui.version": args.rom_version,
         "org.arkui.build.version": args.expected_lineage_version,
@@ -426,9 +668,9 @@ def package(source, stage, target, variables, env, args):
     }.items():
         if props.get(key) != expected_value:
             raise BuildError(f"镜像属性 {key}={props.get(key)!r} 与确认值 {expected_value!r} 不一致")
-    version = props.get("ro.lineage.version", "")
-    if not re.fullmatch(r"[A-Za-z0-9._+-]+", version):
-        raise BuildError("镜像缺少有效的 ro.lineage.version")
+    version = build_name(args)
+    if props.get("ro.lineage.version") != version:
+        raise BuildError("系统发行名称与确认的构建配置不一致")
     artifacts = []
     if target["kind"] == "gsi":
         if variables.get("BUILDING_GSI") != "true" or variables.get("BOARD_SYSTEMIMAGE_FILE_SYSTEM_TYPE") != "ext4":
@@ -445,7 +687,7 @@ def package(source, stage, target, variables, env, args):
         image = output / "system.img"
         if not image.is_file() or not image.stat().st_size:
             raise BuildError("缺少 system.img")
-        name = f"ArkUI-GSI-{target['architecture']}-{target['flavor']}-{version}-{args.build_number}.img"
+        name = f"{version}.img"
         raw_hash = sha256(image)
         with image.open("rb") as source_stream, lzma.open(stage / f"{name}.xz", "wb", preset=6) as compressed:
             shutil.copyfileobj(source_stream, compressed, length=1024 * 1024)
@@ -458,6 +700,7 @@ def package(source, stage, target, variables, env, args):
         (stage / "IMAGE.sha256").write_text(f"{raw_hash}  {name}\n", encoding="utf-8")
         artifacts.append({"file": f"{name}.xz", "raw_sha256": raw_hash, "raw_bytes": image.stat().st_size})
     else:
+        copied = set()
         for pattern in target.get("artifacts", []):
             relative_path(pattern, "artifacts")
             matched = sorted(output.glob(pattern))
@@ -466,7 +709,15 @@ def package(source, stage, target, variables, env, args):
             for file in matched:
                 if not file.is_file() or not file.resolve().is_relative_to(output):
                     raise BuildError(f"产物路径无效: {file}")
+                identity = (file.stat().st_dev, file.stat().st_ino)
+                if identity in copied:
+                    continue
+                copied.add(identity)
                 destination = stage / "images" / file.relative_to(output)
+                if file.suffix == ".zip":
+                    destination = stage / "images" / f"{version}.zip"
+                if destination.exists():
+                    raise BuildError("设备产物匹配到多个 ROM ZIP，请收窄 artifacts 配置")
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(file, destination)
                 artifacts.append({"file": destination.relative_to(stage).as_posix()})
@@ -491,17 +742,26 @@ def release_manifest(target, variables, props, artifacts, source_state, release_
                 "ro.build.fingerprint", "ro.build.tags")
     if any(not props.get(key) for key in required):
         raise BuildError("镜像缺少生成 release.json 所需的版本属性")
+    release_type = props["org.arkui.releasetype"]
+    channel = props.get("org.arkui.channel") or None
+    channel_number = int(props["org.arkui.channel.number"]) if props.get("org.arkui.channel.number") else None
+    if release_type not in RELEASE_TYPES or (
+        release_type == "OFFICIAL" and channel not in RELEASE_CHANNELS
+    ) or (release_type == "UNOFFICIAL" and channel is not None):
+        raise BuildError("镜像的发行类型与更新渠道组合无效")
     sdk, timestamp = int(props["ro.build.version.sdk"]), int(props["ro.build.date.utc"])
     if sdk < 1 or timestamp < 1:
         raise BuildError("镜像中的 SDK 或构建时间无效")
     return {
-        "format": "arkui.release", "schema_version": 1, "release_id": release_id,
+        "format": "arkui.release", "schema_version": 2, "release_id": release_id,
         "created_at": utc_now(),
         "target": {"id": target["id"], "product": target["product"], "kind": target["kind"],
                    "device": props.get("ro.lineage.device") or variables["TARGET_DEVICE"],
                    "board": variables["TARGET_DEVICE"], "architecture": target["architecture"],
                    "flavor": target["flavor"]},
-        "release_type": props["org.arkui.releasetype"],
+        "name": props["ro.lineage.version"],
+        "release_type": release_type, "release_channel": channel,
+        "release_channel_number": channel_number,
         "build_variant": variables["TARGET_BUILD_VARIANT"],
         "versions": {"rom": props["ro.arkui.version"], "base": props["org.arkui.build.version"],
                      "build_number": props["ro.build.version.incremental"],
@@ -519,16 +779,26 @@ def build_one(source, artifacts_root, target, args, catalog):
     builder_hash = sha256(Path(__file__).resolve())
     catalog_hash = sha256(catalog)
     release_id = str(uuid.uuid4())
-    stage = Path(tempfile.mkdtemp(prefix=f".{target['id']}-partial-", dir=artifacts_root))
+    destination = artifacts_root / target["id"] / build_name(args)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise BuildError(f"相同发行名称的产物已存在，拒绝覆盖: {destination}")
+    stage = Path(tempfile.mkdtemp(prefix=".partial-", dir=destination.parent))
     env = os.environ.copy()
     for key in ("OUT_DIR_COMMON_BASE", "OUT_DIR_SUFFIX", "DIST_DIR", "TARGET_PRODUCT", "TARGET_RELEASE",
                 "TARGET_BUILD_VARIANT", "TARGET_BUILD_APPS", "LINEAGE_EXTRAVERSION", "TARGET_UNOFFICIAL_BUILD_ID",
-                "RELEASE_TYPE", "WITH_ADB_INSECURE", "WITH_GMS", "ARKUI_VERSION", "BUILD_NUMBER"):
+                "RELEASE_TYPE", "WITH_ADB_INSECURE", "WITH_GMS", "ARKUI_VERSION", "ARKUI_CHANNEL",
+                "ARKUI_CHANNEL_NUMBER", "ARKUI_BUILD_NUMBER", "BUILD_NUMBER"):
         env.pop(key, None)
     output = target["out_dir"] if args.variant == "userdebug" else f"{target['out_dir']}-{args.variant}"
     env.update(OUT_DIR=output, LINEAGE_BUILDTYPE=args.release_type,
                ARKUI_VERSION=args.rom_version, BUILD_NUMBER=args.build_number,
+               ARKUI_BUILD_NUMBER=args.build_number,
                ARKUI_BUILDER_JOBS=str(args.jobs), ARKUI_BUILDER_VARIANT=args.variant)
+    if args.channel is not None:
+        env["ARKUI_CHANNEL"] = args.channel
+    if args.channel_number is not None:
+        env["ARKUI_CHANNEL_NUMBER"] = str(args.channel_number)
     lock = source_path(source, output) / ".arkui-gsi.lock"
     try:
         with output_lock(lock), (stage / "build.log").open("w", encoding="utf-8") as log:
@@ -552,12 +822,17 @@ def build_one(source, artifacts_root, target, args, catalog):
                 shutil.copy2(source / "vendor/gapps/LICENSE", stage / "LICENSE.gapps")
             write_json(stage / "build.json", {
                 "schema": 1, "target": target, "version": version, "build_variant": args.variant,
-                "release_type": env["LINEAGE_BUILDTYPE"], "started_at": started, "completed_at": utc_now(),
+                "release_type": env["LINEAGE_BUILDTYPE"], "release_channel": args.channel,
+                "release_channel_number": args.channel_number,
+                "started_at": started, "completed_at": utc_now(),
                 "source_state": "dirty" if dirty else "clean", "local_build": True, "build_success": True,
                 "boot_verified": False, "source_dir": str(source), "out_dir": output, "artifacts": files,
                 "builder_sha256": builder_hash, "catalog_sha256": catalog_hash,
                 "release_id": release_id, "confirmed_at": args.confirmed_at,
-                "confirmed_settings": {"release_type": args.release_type, "rom_version": args.rom_version,
+                "build_number_lookup": args.build_number_lookup,
+                "confirmed_settings": {"release_type": args.release_type, "release_channel": args.channel,
+                                       "release_channel_number": args.channel_number,
+                                       "rom_version": args.rom_version,
                                        "build_number": args.build_number, "base_version": args.expected_lineage_version},
             })
             write_json(stage / "release.json", release_manifest(
@@ -565,7 +840,6 @@ def build_one(source, artifacts_root, target, args, catalog):
             lines = [f"{sha256(file)}  {file.relative_to(stage).as_posix()}\n"
                      for file in sorted(stage.rglob("*")) if file.is_file() and file.name != "build.log"]
             (stage / "SHA256SUMS").write_text("".join(lines), encoding="utf-8")
-        destination = artifacts_root / f"{target['id']}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{stage.name.rsplit('-', 1)[-1]}"
         stage.rename(destination)
         print(f"\n编译与打包成功: {destination}\n镜像启动状态：尚未验证。")
         return destination
@@ -612,15 +886,21 @@ def main():
     parser.add_argument("--prepare-dependencies", action="store_true", help="只同步所选目标缺少的独立依赖仓库，不编译")
     parser.add_argument("--jobs", type=int)
     parser.add_argument("--variant", choices=("userdebug", "user", "eng"), default="userdebug")
-    parser.add_argument("--official", action="store_true")
-    parser.add_argument("--release-type", type=str.upper, choices=RELEASE_TYPES, help="发行类型，默认 EXPERIMENTAL")
+    parser.add_argument("--release-type", type=str.upper, choices=RELEASE_TYPES, help="发行类型：OFFICIAL、UNOFFICIAL；默认 OFFICIAL")
+    parser.add_argument("--channel", type=str.lower, choices=RELEASE_CHANNELS, help="仅用于 OFFICIAL：stable、beta、alpha；交互默认 beta")
+    parser.add_argument("--channel-number", type=int, help="Beta/Alpha 编号，例如 1 对应 Beta1；默认 1")
     parser.add_argument("--rom-version", help="本次 ArkUI 版本，例如 1.0.1")
-    parser.add_argument("--build-number", help="本次构建号，对应 ro.build.version.incremental")
+    parser.add_argument("--build-number", help="手动覆盖构建号；默认查询远端最新构建号并加一")
+    parser.add_argument("--build-number-api", help="查询最新构建号的 HTTPS 接口，可通过配置 build_number_api 设置")
     parser.add_argument("--yes", action="store_true", help="显式确认命令行提供的完整版本参数")
     parser.add_argument("--preview", action="store_true", help="仅预览编译配置，不初始化构建环境")
     parser.add_argument("--distro", default="Ubuntu", help="Windows 调用时的 WSL 发行版")
     args = parser.parse_args()
+    args.interactive_configured = False
     config = json.loads(args.config.read_text(encoding="utf-8")) if args.config.is_file() else {}
+    args.build_number_api = args.build_number_api or config.get("build_number_api") or DEFAULT_BUILD_NUMBER_API
+    if not isinstance(args.build_number_api, str):
+        raise BuildError("build_number_api 必须是 HTTPS URL 字符串")
     source_value = args.source or config.get("source_dir") or os.environ.get("ARKUI_SOURCE") or str(Path.cwd())
     source = Path(source_value).expanduser().resolve()
     if not (source / ".repo").is_dir() or not (source / "build/envsetup.sh").is_file():
@@ -630,25 +910,18 @@ def main():
         raise BuildError("--jobs 必须大于 0")
     catalog = args.targets_file.expanduser().resolve()
     targets = load_targets(catalog)
-    menu(source, targets)
     if args.list:
+        menu(source, targets)
         return 0
-    choice = args.select
-    while choice is None:
-        if not sys.stdin.isatty():
-            raise BuildError("非交互终端需要 --select")
-        try:
-            response = input("\n请输入本次目标编号: ").strip()
-        except EOFError:
+    if sys.stdin.isatty() and sys.stdout.isatty() and not (args.yes or args.preview or args.prepare_dependencies):
+        selected = interactive_configure(source, targets, args)
+        if selected is None:
             return 0
-        if response.lower() in ("q", "quit", "exit"):
-            return 0
-        try:
-            selection(response, len(targets))
-            choice = response
-        except BuildError as error:
-            print(error)
-    selected = [targets[index] for index in selection(choice, len(targets))]
+    else:
+        menu(source, targets)
+        if not args.select:
+            raise BuildError("非交互调用需要 --select；直接运行可打开键盘菜单")
+        selected = [targets[index] for index in selection(args.select, len(targets))]
     if args.prepare_dependencies:
         with output_lock(source / "out/.arkui-builder.lock"):
             prepare_dependencies(source, selected)

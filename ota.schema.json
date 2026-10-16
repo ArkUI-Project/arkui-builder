@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArkUI official OTA response",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["datetime", "type", "channel", "channel_number", "version", "build_number", "files"],
+    "properties": {
+      "datetime": { "type": "integer", "minimum": 1 },
+      "type": { "const": "OFFICIAL" },
+      "channel": { "enum": ["stable", "beta", "alpha"] },
+      "channel_number": { "type": ["integer", "null"], "minimum": 1, "maximum": 2147483647 },
+      "version": { "type": "string", "pattern": "^[0-9]+(?:\\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.-]+)?$" },
+      "build_number": { "type": "string", "pattern": "^(?!eng\\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+      "files": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 1,
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "filename", "url", "sha256", "size", "os_patch_level", "os_sdk_level"
+          ],
+          "properties": {
+            "filename": { "type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._+ -]*\\.zip$" },
+            "url": { "type": "string", "format": "uri", "pattern": "^https://" },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "size": { "type": "integer", "minimum": 1 },
+            "os_patch_level": { "type": "string", "format": "date", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+            "os_sdk_level": { "type": "integer", "minimum": 1 },
+            "ota_property_files": { "type": ["string", "null"], "minLength": 1 }
+          }
+        }
+      }
+    },
+    "if": { "properties": { "channel": { "const": "stable" } } },
+    "then": { "properties": { "channel_number": { "type": "null" } } },
+    "else": { "properties": { "channel_number": { "type": "integer" } } }
+  }
+}
