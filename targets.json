@@ -3,7 +3,7 @@
   "targets": [
     {
       "id": "gsi-arm64-vanilla",
-      "name": "ARM64 GSI — 不含 Google 服务",
+      "name": "ARM64 GSI (Vanilla)",
       "product": "lineage_gsi_arkui_arm64",
       "kind": "gsi",
       "architecture": "arm64",
@@ -15,7 +15,7 @@
     },
     {
       "id": "gsi-arm64-gms",
-      "name": "ARM64 GSI — 包含 Google 服务",
+      "name": "ARM64 GSI (GMS)",
       "product": "lineage_gsi_arkui_gms_arm64",
       "kind": "gsi",
       "architecture": "arm64",
@@ -30,6 +30,108 @@
           "path": "vendor/gapps",
           "repository": "MindTheGapps/vendor_gapps",
           "revision": "39bd3a09640efb81234cdbd8ab98ab71541d5d46"
+        }
+      ]
+    },
+    {
+      "id": "raphael-vanilla",
+      "name": "Redmi K20 Pro / Mi 9T Pro (Vanilla)",
+      "product": "lineage_raphael",
+      "kind": "device",
+      "architecture": "arm64",
+      "flavor": "vanilla",
+      "out_dir": "out/arkui-raphael",
+      "goals": ["bacon"],
+      "artifacts": ["{release_name}.zip", "boot.img", "recovery.img"],
+      "required_paths": [
+        "device/xiaomi/raphael/lineage_raphael.mk",
+        "device/xiaomi/sm8150-common/BoardConfigCommon.mk",
+        "hardware/xiaomi/Android.bp",
+        "kernel/xiaomi/sm8150/Makefile",
+        "vendor/xiaomi/raphael/raphael-vendor.mk",
+        "vendor/xiaomi/sm8150-common/sm8150-common-vendor.mk"
+      ],
+      "dependencies": [
+        {
+          "path": "device/xiaomi/raphael",
+          "repository": "ArkUI-Project/android_device_xiaomi_raphael",
+          "revision": "lineage-23.2"
+        },
+        {
+          "path": "device/xiaomi/sm8150-common",
+          "repository": "ArkUI-Project/android_device_xiaomi_sm8150-common",
+          "revision": "lineage-23.2"
+        },
+        {
+          "path": "hardware/xiaomi",
+          "repository": "LineageOS/android_hardware_xiaomi",
+          "revision": "b72a93939350632d3033b1218b10af0f9c0ae5c2"
+        },
+        {
+          "path": "kernel/xiaomi/sm8150",
+          "repository": "LineageOS/android_kernel_xiaomi_sm8150",
+          "revision": "59220a048d04516e7fe1dfc094507930166a1e60"
+        },
+        {
+          "path": "vendor/xiaomi/raphael",
+          "repository": "TheMuppets/proprietary_vendor_xiaomi_raphael",
+          "revision": "8c5eb865d0ad9f18fa6fb16bb0cd00e32e6443e0"
+        },
+        {
+          "path": "vendor/xiaomi/sm8150-common",
+          "repository": "TheMuppets/proprietary_vendor_xiaomi_sm8150-common",
+          "revision": "eea30efdd31677a1fa48168c4dcdea6852d3b039"
+        }
+      ]
+    },
+    {
+      "id": "sagit-vanilla",
+      "name": "小米 6 (Vanilla)",
+      "product": "lineage_sagit",
+      "kind": "device",
+      "architecture": "arm64",
+      "flavor": "vanilla",
+      "out_dir": "out/arkui-sagit",
+      "goals": ["bacon"],
+      "artifacts": ["{release_name}.zip", "boot.img", "recovery.img"],
+      "required_paths": [
+        "device/xiaomi/sagit/lineage_sagit.mk",
+        "device/xiaomi/msm8998-common/BoardConfigCommon.mk",
+        "hardware/xiaomi/Android.bp",
+        "kernel/xiaomi/msm8998/Makefile",
+        "vendor/xiaomi/sagit/sagit-vendor.mk",
+        "vendor/xiaomi/msm8998-common/msm8998-common-vendor.mk"
+      ],
+      "dependencies": [
+        {
+          "path": "device/xiaomi/sagit",
+          "repository": "ArkUI-Project/android_device_xiaomi_sagit",
+          "revision": "lineage-23.2"
+        },
+        {
+          "path": "device/xiaomi/msm8998-common",
+          "repository": "ArkUI-Project/android_device_xiaomi_msm8998-common",
+          "revision": "lineage-23.2"
+        },
+        {
+          "path": "hardware/xiaomi",
+          "repository": "LineageOS/android_hardware_xiaomi",
+          "revision": "b72a93939350632d3033b1218b10af0f9c0ae5c2"
+        },
+        {
+          "path": "kernel/xiaomi/msm8998",
+          "repository": "xiaomi-msm8998-devs/android_kernel_xiaomi_msm8998",
+          "revision": "15e2687e40a47a7e6bb86dbf746a37c657b2092f"
+        },
+        {
+          "path": "vendor/xiaomi/sagit",
+          "repository": "xiaomi-msm8998-devs/proprietary_vendor_xiaomi_sagit",
+          "revision": "fe1359dbefa24d229d35fdd5102dc2dc69559a46"
+        },
+        {
+          "path": "vendor/xiaomi/msm8998-common",
+          "repository": "xiaomi-msm8998-devs/proprietary_vendor_xiaomi_msm8998-common",
+          "revision": "675c5be457192818b8c07fd4fc50e67a8c4332c7"
         }
       ]
     }

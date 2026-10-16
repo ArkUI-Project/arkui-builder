@@ -702,6 +702,7 @@ def package(source, stage, target, variables, env, args):
     else:
         copied = set()
         for pattern in target.get("artifacts", []):
+            pattern = pattern.replace("{release_name}", version)
             relative_path(pattern, "artifacts")
             matched = sorted(output.glob(pattern))
             if not matched:
