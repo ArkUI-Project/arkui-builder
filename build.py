@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import xml.etree.ElementTree as ET
 
 
@@ -49,6 +50,11 @@ fi
 
 class BuildError(Exception):
     pass
+
+
+RELEASE_TYPES = ("EXPERIMENTAL", "OFFICIAL", "RELEASE", "NIGHTLY", "SNAPSHOT", "UNOFFICIAL")
+ROM_VERSION_PATTERN = r"[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.-]+)?"
+BUILD_NUMBER_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 
 
 def utc_now():
@@ -164,6 +170,83 @@ def menu(source, targets):
         for path in missing:
             print(f"     缺少: {path}")
     print("编号可多选，例如 1,2 或 1-2；all 全选；q 退出。", flush=True)
+
+
+def source_versions(source):
+    text = (source / "vendor/lineage/config/version.mk").read_text(encoding="utf-8")
+    values = {}
+    for name in ("ARKUI_VERSION", "PRODUCT_VERSION_MAJOR", "PRODUCT_VERSION_MINOR"):
+        match = re.search(rf"^{name}\s*[?:]?=\s*(\S+)\s*$", text, re.MULTILINE)
+        if not match:
+            raise BuildError(f"无法从源码读取默认版本: {name}")
+        values[name] = match[1]
+    return values["ARKUI_VERSION"], values["PRODUCT_VERSION_MAJOR"] + "." + values["PRODUCT_VERSION_MINOR"]
+
+
+def valid_build_number(value):
+    # AOSP replaces eng.* build numbers with a timestamp in build.prop.
+    return re.fullmatch(BUILD_NUMBER_PATTERN, value) and not value.startswith("eng.")
+
+
+def configure_release(source, selected, args):
+    def ask(prompt):
+        try:
+            return input(prompt)
+        except EOFError as error:
+            raise BuildError("未收到编译确认，已取消") from error
+
+    default_version, lineage_version = source_versions(source)
+    if args.official and args.release_type not in (None, "OFFICIAL"):
+        raise BuildError("--official 与 --release-type 不一致")
+    release_type = args.release_type or ("OFFICIAL" if args.official else "EXPERIMENTAL")
+    rom_version = args.rom_version or default_version
+    build_number = args.build_number or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    interactive = sys.stdin.isatty() and not args.yes and not args.preview
+    if args.yes and not (args.rom_version and args.build_number and (args.release_type or args.official)):
+        raise BuildError("--yes 需要显式提供 --release-type、--rom-version 和 --build-number")
+    if not interactive and not args.yes and not args.preview:
+        raise BuildError("编译前需要交互确认；自动化调用请提供完整版本参数和 --yes")
+    if interactive:
+        print("\n本次发行类型：")
+        for index, name in enumerate(RELEASE_TYPES, 1):
+            print(f"  {index}. {name}")
+        while True:
+            value = ask(f"发行类型 [{release_type}]: ").strip().upper() or release_type
+            if value.isdigit() and 1 <= int(value) <= len(RELEASE_TYPES):
+                value = RELEASE_TYPES[int(value) - 1]
+            if value in RELEASE_TYPES:
+                release_type = value
+                break
+            print("请输入列表中的编号或发行类型名称。")
+        while True:
+            value = ask(f"ArkUI 版本 ro.arkui.version [{rom_version}]: ").strip() or rom_version
+            if re.fullmatch(ROM_VERSION_PATTERN, value):
+                rom_version = value
+                break
+            print("版本格式示例：1.0、1.0.1、1.1.0-beta.1")
+        while True:
+            value = ask(f"构建号 ro.build.version.incremental [{build_number}]: ").strip() or build_number
+            if valid_build_number(value):
+                build_number = value
+                break
+            print("构建号限 1–64 位字母、数字、点、下划线或短横线，不能以 eng. 开头。")
+    if release_type not in RELEASE_TYPES or not re.fullmatch(ROM_VERSION_PATTERN, rom_version) or not valid_build_number(build_number):
+        raise BuildError("发行类型、ArkUI 版本或构建号无效")
+    args.release_type, args.rom_version, args.build_number = release_type, rom_version, build_number
+    print("\n编译前确认：")
+    print("  目标: " + ", ".join(target["name"] for target in selected))
+    print(f"  发行类型: {release_type}\n  ArkUI 版本: {rom_version}\n  构建号: {build_number}")
+    print(f"  基础版本 org.arkui.build.version: {lineage_version}（由源码决定）")
+    print(f"  编译类型: {args.variant}\n  并行任务: {args.jobs}")
+    if args.preview:
+        print("仅预览，未确认或启动编译。")
+        return False
+    if interactive and ask("输入 yes 开始编译，直接回车取消: ").strip().lower() != "yes":
+        print("已取消编译。")
+        return False
+    args.confirmed_at = utc_now()
+    args.expected_lineage_version = lineage_version
+    return True
 
 
 def checked(command, **kwargs):
@@ -315,7 +398,7 @@ def read_properties(path):
     return values
 
 
-def package(source, stage, target, variables, env):
+def package(source, stage, target, variables, env, args):
     output = Path(variables["PRODUCT_OUT"]).resolve()
     expected = (source / env["OUT_DIR"]).resolve()
     if not output.is_relative_to(expected):
@@ -332,11 +415,19 @@ def package(source, stage, target, variables, env):
         "system_ext": Path(variables["TARGET_OUT_SYSTEM_EXT"]) / "etc/build.prop",
     }.items():
         shutil.copy2(path, properties / f"{label}.build.prop")
-    props = read_properties(properties / "product.build.prop")
-    if props.get("ro.lineage.releasetype") != env["LINEAGE_BUILDTYPE"]:
+    props = read_properties(properties / "system.build.prop")
+    props.update(read_properties(properties / "product.build.prop"))
+    if props.get("org.arkui.releasetype") != env["LINEAGE_BUILDTYPE"]:
         raise BuildError("实际发行类型不符合选择")
+    for key, expected_value in {
+        "ro.arkui.version": args.rom_version,
+        "org.arkui.build.version": args.expected_lineage_version,
+        "ro.build.version.incremental": args.build_number,
+    }.items():
+        if props.get(key) != expected_value:
+            raise BuildError(f"镜像属性 {key}={props.get(key)!r} 与确认值 {expected_value!r} 不一致")
     version = props.get("ro.lineage.version", "")
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", version):
+    if not re.fullmatch(r"[A-Za-z0-9._+-]+", version):
         raise BuildError("镜像缺少有效的 ro.lineage.version")
     artifacts = []
     if target["kind"] == "gsi":
@@ -354,7 +445,7 @@ def package(source, stage, target, variables, env):
         image = output / "system.img"
         if not image.is_file() or not image.stat().st_size:
             raise BuildError("缺少 system.img")
-        name = f"ArkUI-GSI-{target['architecture']}-{target['flavor']}-{version}.img"
+        name = f"ArkUI-GSI-{target['architecture']}-{target['flavor']}-{version}-{args.build_number}.img"
         raw_hash = sha256(image)
         with image.open("rb") as source_stream, lzma.open(stage / f"{name}.xz", "wb", preset=6) as compressed:
             shutil.copyfileobj(source_stream, compressed, length=1024 * 1024)
@@ -381,28 +472,69 @@ def package(source, stage, target, variables, env):
                 artifacts.append({"file": destination.relative_to(stage).as_posix()})
         if not artifacts:
             raise BuildError("device 目标必须配置 artifacts 数组，例如 [\"*.zip\"]")
-    return version, artifacts
+    for artifact in artifacts:
+        file = stage / artifact["file"]
+        if not re.fullmatch(r"(?:[A-Za-z0-9_-][A-Za-z0-9._+ -]*/)*[A-Za-z0-9_-][A-Za-z0-9._+ -]*", artifact["file"]):
+            raise BuildError(f"产物文件名不符合发布格式: {artifact['file']}")
+        if not file.stat().st_size or not re.fullmatch(r"[a-z0-9]+", file.suffix.lstrip(".").lower()):
+            raise BuildError(f"产物为空或缺少文件格式: {file.name}")
+        artifact.update(bytes=file.stat().st_size, sha256=sha256(file),
+                        role="system" if target["kind"] == "gsi" else "rom",
+                        format=file.suffix.lstrip(".").lower())
+    return version, artifacts, props
+
+
+def release_manifest(target, variables, props, artifacts, source_state, release_id):
+    required = ("org.arkui.releasetype", "org.arkui.build.version", "ro.arkui.version",
+                "ro.build.version.incremental", "ro.lineage.version", "ro.build.version.release",
+                "ro.build.version.sdk", "ro.build.version.security_patch", "ro.build.date.utc",
+                "ro.build.fingerprint", "ro.build.tags")
+    if any(not props.get(key) for key in required):
+        raise BuildError("镜像缺少生成 release.json 所需的版本属性")
+    sdk, timestamp = int(props["ro.build.version.sdk"]), int(props["ro.build.date.utc"])
+    if sdk < 1 or timestamp < 1:
+        raise BuildError("镜像中的 SDK 或构建时间无效")
+    return {
+        "format": "arkui.release", "schema_version": 1, "release_id": release_id,
+        "created_at": utc_now(),
+        "target": {"id": target["id"], "product": target["product"], "kind": target["kind"],
+                   "device": props.get("ro.lineage.device") or variables["TARGET_DEVICE"],
+                   "board": variables["TARGET_DEVICE"], "architecture": target["architecture"],
+                   "flavor": target["flavor"]},
+        "release_type": props["org.arkui.releasetype"],
+        "build_variant": variables["TARGET_BUILD_VARIANT"],
+        "versions": {"rom": props["ro.arkui.version"], "base": props["org.arkui.build.version"],
+                     "build_number": props["ro.build.version.incremental"],
+                     "display": props["ro.lineage.version"], "android": props["ro.build.version.release"],
+                     "sdk": sdk, "security_patch": props["ro.build.version.security_patch"]},
+        "build_timestamp": timestamp, "fingerprint": props["ro.build.fingerprint"],
+        "build_tags": props["ro.build.tags"], "source_state": source_state,
+        "validation": {"build_success": True, "boot_verified": False},
+        "artifacts": artifacts,
+    }
 
 
 def build_one(source, artifacts_root, target, args, catalog):
     started = utc_now()
     builder_hash = sha256(Path(__file__).resolve())
     catalog_hash = sha256(catalog)
+    release_id = str(uuid.uuid4())
     stage = Path(tempfile.mkdtemp(prefix=f".{target['id']}-partial-", dir=artifacts_root))
     env = os.environ.copy()
     for key in ("OUT_DIR_COMMON_BASE", "OUT_DIR_SUFFIX", "DIST_DIR", "TARGET_PRODUCT", "TARGET_RELEASE",
                 "TARGET_BUILD_VARIANT", "TARGET_BUILD_APPS", "LINEAGE_EXTRAVERSION", "TARGET_UNOFFICIAL_BUILD_ID",
-                "RELEASE_TYPE", "WITH_ADB_INSECURE", "WITH_GMS"):
+                "RELEASE_TYPE", "WITH_ADB_INSECURE", "WITH_GMS", "ARKUI_VERSION", "BUILD_NUMBER"):
         env.pop(key, None)
     output = target["out_dir"] if args.variant == "userdebug" else f"{target['out_dir']}-{args.variant}"
-    env.update(OUT_DIR=output, LINEAGE_BUILDTYPE="OFFICIAL" if args.official else "EXPERIMENTAL",
+    env.update(OUT_DIR=output, LINEAGE_BUILDTYPE=args.release_type,
+               ARKUI_VERSION=args.rom_version, BUILD_NUMBER=args.build_number,
                ARKUI_BUILDER_JOBS=str(args.jobs), ARKUI_BUILDER_VARIANT=args.variant)
     lock = source_path(source, output) / ".arkui-gsi.lock"
     try:
         with output_lock(lock), (stage / "build.log").open("w", encoding="utf-8") as log:
             snapshot(source, stage / "source-before", log)
             dirty = bool((stage / "source-before/source-status.txt").stat().st_size)
-            if args.official and dirty:
+            if args.release_type == "OFFICIAL" and dirty:
                 raise BuildError("OFFICIAL 构建要求源码工作树干净，详见 source-before/source-status.txt")
             command = ["bash", "-c", BUILD_SHELL, "arkui-build", target["product"], args.variant,
                        target["kind"], str(args.jobs), str(stage / "build-vars.txt"), *target.get("goals", [])]
@@ -413,7 +545,8 @@ def build_one(source, artifacts_root, target, args, catalog):
                     raise BuildError(f"构建期间源码变化: {file.name}")
             if sha256(Path(__file__).resolve()) != builder_hash or sha256(catalog) != catalog_hash:
                 raise BuildError("构建期间编译工具或目标配置发生变化")
-            version, files = package(source, stage, target, read_variables(stage / "build-vars.txt"), env)
+            variables = read_variables(stage / "build-vars.txt")
+            version, files, props = package(source, stage, target, variables, env, args)
             shutil.copy2(source / "vendor/lineage/LICENSE", stage / "LICENSE.vendor-lineage")
             if target["flavor"] == "gms":
                 shutil.copy2(source / "vendor/gapps/LICENSE", stage / "LICENSE.gapps")
@@ -423,7 +556,12 @@ def build_one(source, artifacts_root, target, args, catalog):
                 "source_state": "dirty" if dirty else "clean", "local_build": True, "build_success": True,
                 "boot_verified": False, "source_dir": str(source), "out_dir": output, "artifacts": files,
                 "builder_sha256": builder_hash, "catalog_sha256": catalog_hash,
+                "release_id": release_id, "confirmed_at": args.confirmed_at,
+                "confirmed_settings": {"release_type": args.release_type, "rom_version": args.rom_version,
+                                       "build_number": args.build_number, "base_version": args.expected_lineage_version},
             })
+            write_json(stage / "release.json", release_manifest(
+                target, variables, props, files, "dirty" if dirty else "clean", release_id))
             lines = [f"{sha256(file)}  {file.relative_to(stage).as_posix()}\n"
                      for file in sorted(stage.rglob("*")) if file.is_file() and file.name != "build.log"]
             (stage / "SHA256SUMS").write_text("".join(lines), encoding="utf-8")
@@ -475,6 +613,11 @@ def main():
     parser.add_argument("--jobs", type=int)
     parser.add_argument("--variant", choices=("userdebug", "user", "eng"), default="userdebug")
     parser.add_argument("--official", action="store_true")
+    parser.add_argument("--release-type", type=str.upper, choices=RELEASE_TYPES, help="发行类型，默认 EXPERIMENTAL")
+    parser.add_argument("--rom-version", help="本次 ArkUI 版本，例如 1.0.1")
+    parser.add_argument("--build-number", help="本次构建号，对应 ro.build.version.incremental")
+    parser.add_argument("--yes", action="store_true", help="显式确认命令行提供的完整版本参数")
+    parser.add_argument("--preview", action="store_true", help="仅预览编译配置，不初始化构建环境")
     parser.add_argument("--distro", default="Ubuntu", help="Windows 调用时的 WSL 发行版")
     args = parser.parse_args()
     config = json.loads(args.config.read_text(encoding="utf-8")) if args.config.is_file() else {}
@@ -514,6 +657,8 @@ def main():
         missing = missing_paths(source, target)
         if missing:
             raise BuildError(f"{target['name']} 缺少: {', '.join(missing)}。可用 --prepare-dependencies --select {targets.index(target) + 1} 准备独立依赖仓库。")
+    if not configure_release(source, selected, args):
+        return 0
     artifacts_root = Path(args.artifacts_dir).expanduser() if args.artifacts_dir else args.config.resolve().parent / "artifacts/builder"
     artifacts_root = artifacts_root.resolve()
     if artifacts_root.is_relative_to(source):
