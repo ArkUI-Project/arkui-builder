@@ -307,6 +307,198 @@ def configure_release(source, selected, args):
     return True
 
 
+class _BuildMenuUI:
+    def __init__(self, screen, curses):
+        self.screen = screen
+        self.curses = curses
+        self.usable = True
+        self.scroll_limit = 0
+        self.styles = {
+            "normal": curses.A_NORMAL, "muted": curses.A_DIM,
+            "accent": curses.A_BOLD, "heading": curses.A_BOLD,
+            "border": curses.A_DIM, "selected": curses.A_REVERSE | curses.A_BOLD,
+            "success": curses.A_NORMAL, "warning": curses.A_BOLD,
+        }
+        if curses.has_colors():
+            try:
+                curses.start_color()
+                background = -1
+                try:
+                    curses.use_default_colors()
+                except curses.error:
+                    background = curses.COLOR_BLACK
+                for number, foreground, back in (
+                    (1, curses.COLOR_CYAN, background),
+                    (2, curses.COLOR_WHITE, background),
+                    (3, curses.COLOR_BLACK, curses.COLOR_CYAN),
+                    (4, curses.COLOR_GREEN, background),
+                    (5, curses.COLOR_YELLOW, background),
+                ):
+                    curses.init_pair(number, foreground, back)
+                self.styles.update({
+                    "accent": curses.color_pair(1) | curses.A_BOLD,
+                    "heading": curses.color_pair(1),
+                    "border": curses.color_pair(2) | curses.A_DIM,
+                    "selected": curses.color_pair(3) | curses.A_BOLD,
+                    "success": curses.color_pair(4),
+                    "warning": curses.color_pair(5),
+                })
+            except curses.error:
+                pass
+
+    @staticmethod
+    def _width(text):
+        return sum(0 if unicodedata.combining(char) else
+                   2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+                   for char in text)
+
+    @classmethod
+    def _clip(cls, text, width):
+        text = str(text).replace("\n", " ").replace("\r", " ").replace("\t", " ")
+        if width < 1:
+            return ""
+        if cls._width(text) <= width:
+            return text
+        result, used = [], 0
+        for char in text:
+            size = cls._width(char)
+            if used + size > width - 1:
+                break
+            result.append(char)
+            used += size
+        return "".join(result) + "…"
+
+    @classmethod
+    def _pad(cls, text, width):
+        text = cls._clip(text, width)
+        return text + " " * max(0, width - cls._width(text))
+
+    def _put(self, y, x, text, width, role="normal"):
+        height, columns = self.screen.getmaxyx()
+        if not 0 <= y < height or not 0 <= x < columns - 1:
+            return
+        text = self._clip(text, min(width, columns - x - 1))
+        if text:
+            try:
+                self.screen.addstr(y, x, text, self.styles[role])
+            except self.curses.error:
+                # A terminal resize can invalidate coordinates between calls.
+                pass
+
+    @classmethod
+    def _wrap(cls, text, width):
+        line, used = "", 0
+        for char in str(text):
+            size = cls._width(char)
+            if char == "\n" or used + size > width:
+                yield line
+                line, used = "", 0
+                if char == "\n":
+                    continue
+            line += char
+            used += size
+        if line:
+            yield line
+
+    def draw(self, lines, active=0, *, title="构建配置", subtitle="配置目标与发行信息",
+             footer="↑↓ 选择  ←→ 调整  Enter 编辑/执行  Esc 退出", status="",
+             sections=None, details=None, preview=None, align_values=False, compact=False,
+             status_error=False, short_footer="↑↓ 选择  ←→ 调整  Enter 确认  Esc 返回",
+             scroll_offset=None):
+        self.screen.erase()
+        rows, columns = self.screen.getmaxyx()
+        self.usable = rows >= 18 and columns >= 60
+        if not self.usable:
+            self.scroll_limit = 0
+            self._put(max(0, rows // 2 - 1), 1, "请将终端调整到至少 60 列 × 18 行", columns - 2, "warning")
+            self._put(max(0, rows // 2 + 1), 1, "调整后自动恢复；Esc 返回", columns - 2, "muted")
+            self.screen.refresh()
+            return
+
+        width = min(columns - 4, 116 if not compact else 86)
+        height = min(rows - 2, 32 if not compact else 18)
+        top, left = (rows - height) // 2, (columns - width) // 2
+        bottom, right = top + height - 1, left + width - 1
+        self._put(top, left, "╭" + "─" * (width - 2) + "╮", width, "border")
+        self._put(bottom, left, "╰" + "─" * (width - 2) + "╯", width, "border")
+        for y in range(top + 1, bottom):
+            self._put(y, left, "│", 1, "border")
+            self._put(y, right, "│", 1, "border")
+        self._put(top + 1, left + 3, "ARKUI", 8, "accent")
+        self._put(top + 1, left + 11, "构建工作台", 14, "accent")
+        page = title + (f"  {active + 1}/{len(lines)}" if active is not None and lines else "")
+        page = self._clip(page, width - 32)
+        self._put(top + 1, right - self._width(page) - 2, page, self._width(page), "muted")
+        self._put(top + 2, left + 3, subtitle, width - 6, "muted")
+        separator = "├" + "─" * (width - 2) + "┤"
+        self._put(top + 3, left, separator, width, "border")
+        footer_y = bottom - 4
+        self._put(footer_y, left, separator, width, "border")
+
+        content_top, content_height = top + 5, footer_y - top - 5
+        list_left, list_width = left + 3, width - 6
+        show_preview = bool(preview) and width >= 100
+        if show_preview:
+            list_width = (width - 9) // 2
+            divider = list_left + list_width + 1
+            for y in range(top + 4, footer_y):
+                self._put(y, divider, "│", 1, "border")
+            preview_left, preview_width = divider + 3, right - divider - 5
+            y = content_top
+            for role, text in preview:
+                for line in list(self._wrap(text, preview_width)) or [""]:
+                    if y >= footer_y:
+                        break
+                    self._put(y, preview_left, line, preview_width, role)
+                    y += 1
+                if y >= footer_y:
+                    break
+
+        entries, positions = [], {}
+        for index, line in enumerate(lines):
+            if sections and index in sections:
+                if entries:
+                    entries.append((None, "", "muted"))
+                entries.append((None, sections[index], "heading"))
+            positions[index] = len(entries)
+            if align_values:
+                label, separator, value = line.partition("：")
+                line = self._pad(label, 14) + ("  " + value if separator else "")
+            entries.append((index, line, "normal"))
+            if details:
+                entries.append((None, "   " + details[index], "muted"))
+        selected_y = positions.get(active, 0)
+        start = max(0, selected_y - content_height + 1)
+        self.scroll_limit = max(0, len(entries) - content_height)
+        if scroll_offset is not None:
+            start = max(0, min(scroll_offset, self.scroll_limit))
+        for offset, (index, line, role) in enumerate(entries[start:start + content_height]):
+            selected = index is not None and index == active
+            if index is not None:
+                line = ("› " if selected else "  ") + line
+            if selected:
+                line, role = self._pad(line, list_width), "selected"
+            self._put(content_top + offset, list_left, line, list_width, role)
+
+        role = "warning" if status_error else "success"
+        message = status or "修改将在开始编译前再次确认。"
+        for index, line in enumerate(self._wrap(message, width - 6)):
+            if index == 2:
+                break
+            self._put(footer_y + 1 + index, left + 3, line, width - 6,
+                      role if status else "muted")
+        if self._width(footer) > width - 6:
+            footer = short_footer
+        self._put(footer_y + 3, left + 3, footer, width - 6, "muted")
+        self.screen.refresh()
+
+    def read_key(self):
+        while True:
+            key = self.screen.get_wch()
+            if self.usable or key in ("\x1b", self.curses.KEY_RESIZE):
+                return key
+
+
 def interactive_configure(source, targets, args):
     try:
         import curses
@@ -328,37 +520,42 @@ def interactive_configure(source, targets, args):
         except curses.error:
             pass
         screen.keypad(True)
+        ui = _BuildMenuUI(screen, curses)
         status = ""
+        status_error = False
 
-        def put(y, text, selected=False):
-            height, width = screen.getmaxyx()
-            if y < 0 or y >= height - 1:
-                return
-            result, cells = "", 0
-            for char in str(text):
-                cells += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-                if cells > width - 3:
-                    break
-                result += char
-            screen.addstr(y, 1, result, curses.A_REVERSE if selected else curses.A_NORMAL)
+        def preview_name():
+            if args.build_number:
+                return build_name(args)
+            return f"ArkUI-{args.rom_version}-{args.release_type}-{channel_label(args.channel, args.channel_number)}-待填写构建号"
 
-        def draw(lines, active=0, footer="↑↓ 移动  ←→ 调整  Enter 编辑/确认  Esc 返回"):
-            screen.erase()
-            put(0, "ArkUI 编译工具")
-            height, _ = screen.getmaxyx()
-            visible = max(1, height - 7)
-            start = max(0, active - visible + 1)
-            for index, line in enumerate(lines[start:start + visible], start):
-                put(index - start + 2, line, index == active)
-            put(height - 4, status)
-            put(height - 2, footer)
-            screen.refresh()
+        def preview(hint):
+            selected = [targets[i] for i in sorted(chosen)]
+            lines = [("heading", "本次发行"), ("normal", preview_name()),
+                     ("muted", f"{args.variant} · {args.jobs} 个并行任务"), ("normal", ""),
+                     ("heading", f"已选目标  ·  {len(selected)}")]
+            if not selected:
+                lines.append(("warning", "尚未选择编译目标"))
+            for target in selected[:4]:
+                lines.append(("normal", "• " + target["name"]))
+            if len(selected) > 4:
+                lines.append(("muted", f"另有 {len(selected) - 4} 个目标"))
+            lines.extend([("normal", ""), ("heading", "当前操作"), ("muted", hint)])
+            return lines
 
         def edit(title, value):
             text = str(value or "")
             while True:
-                draw([title, text + "▏"], 1, "输入新值；Backspace 删除；Ctrl+U 清空；Enter 保存；Esc 取消")
-                key = screen.get_wch()
+                visible = text
+                limit = max(8, min(screen.getmaxyx()[1] - 14, 74))
+                while ui._width(visible) > limit:
+                    visible = visible[1:]
+                if visible != text:
+                    visible = "…" + visible
+                ui.draw([visible + "▏"], title="编辑" + title, subtitle="输入新的值，保存后返回构建配置。",
+                        footer="Enter 保存  Esc 取消  Backspace 删除  Ctrl+U 清空", compact=True,
+                        short_footer="Enter 保存  Esc 取消  Ctrl+U 清空")
+                key = ui.read_key()
                 if key in ("\n", "\r", curses.KEY_ENTER):
                     return text.strip()
                 if key == "\x1b":
@@ -373,23 +570,35 @@ def interactive_configure(source, targets, args):
         def pick_targets():
             index = 0
             while True:
-                lines = [f"[{'x' if i in chosen else ' '}] {t['name']}" +
-                         ("（缺少依赖）" if missing_paths(source, t) else "") for i, t in enumerate(targets)]
-                draw(lines, index, "↑↓ 移动；空格/←→ 多选；Enter 完成；Esc 返回")
-                key = screen.get_wch()
+                lines = [f"[{'✓' if i in chosen else ' '}] {i + 1:02d}  {t['name']}"
+                         for i, t in enumerate(targets)]
+                details = [f"{t['architecture'].upper()} · " +
+                           ("缺少依赖" if missing_paths(source, t) else "依赖就绪")
+                           for t in targets]
+                ui.draw(lines, index, title="选择编译目标", subtitle=f"已选 {len(chosen)} 项 · 按列表顺序依次编译",
+                        footer="↑↓ 选择  Space/←→ 勾选  Enter 完成  Esc 返回", details=details,
+                        preview=preview(targets[index]["product"] + "；A 全选，N 清空。"),
+                        short_footer="↑↓ 移动  空格选择  Enter 完成  Esc 返回")
+                key = ui.read_key()
                 if key == curses.KEY_UP:
                     index = (index - 1) % len(targets)
                 elif key == curses.KEY_DOWN:
                     index = (index + 1) % len(targets)
                 elif key in (" ", curses.KEY_LEFT, curses.KEY_RIGHT):
                     chosen.symmetric_difference_update({index})
+                elif key in ("a", "A"):
+                    chosen.update(range(len(targets)))
+                elif key in ("n", "N"):
+                    chosen.clear()
                 elif key in ("\n", "\r", curses.KEY_ENTER, "\x1b"):
                     return
 
         def query_number(replace=False):
-            nonlocal status
+            nonlocal status, status_error
             status = "正在查询远端最新构建号……"
-            draw([status])
+            status_error = False
+            ui.draw([status], active=None, title="查询构建号", subtitle="读取完成后可手动修改建议值。",
+                    compact=True)
             try:
                 number = refresh_build_number(args)
                 if replace or not args.build_number:
@@ -397,25 +606,47 @@ def interactive_configure(source, targets, args):
                 status = f"远端最新：{args.build_number_lookup['latest']}；自动建议：{number}"
             except BuildError as error:
                 status = f"查询失败，请编辑构建号：{error}"
+                status_error = True
 
         query_number()
         active = 0
+        hints = {
+            "targets": "Enter 打开目标列表，Space 勾选；支持同时编译多个目标。",
+            "release_type": "←→ 切换 OFFICIAL / UNOFFICIAL；非官方构建不使用更新渠道。",
+            "channel": "←→ 选择 Stable、Beta 或 Alpha。",
+            "channel_number": "←→ 调整编号，Enter 输入；例如 Beta1、Beta2。",
+            "rom_version": "Enter 编辑 ArkUI 版本；发行名称和镜像版本属性会同步使用这个值。",
+            "build_number": "Enter 手动编辑，或选择“刷新构建号”获取远端最新编号加一。",
+            "jobs": "←→ 调整并行任务数，Enter 直接输入。",
+            "variant": "←→ 选择 userdebug、user 或 eng。",
+            "refresh": "Enter 重新查询远端最新构建号，并采用递增后的建议值。",
+            "prepare": "Enter 准备所选目标缺少的独立仓库依赖。",
+            "start": "Enter 查看最终确认页，确认后开始依次编译所选目标。",
+            "cancel": "Enter 退出构建菜单。",
+        }
         while True:
-            rows = [("targets", f"编译目标：已选择 {len(chosen)} 项"),
-                    ("release_type", f"发行类型：{args.release_type}")]
+            rows = [("targets", f"编译目标：{len(chosen)} 项已选"),
+                    ("release_type", f"发行类型：{args.release_type} · " +
+                     ("官方构建" if args.release_type == "OFFICIAL" else "非官方构建"))]
             if args.release_type == "OFFICIAL":
-                rows.append(("channel", f"更新渠道：{args.channel}"))
+                rows.append(("channel", f"更新渠道：{args.channel.capitalize()}"))
                 if args.channel != "stable":
-                    rows.append(("channel_number", f"渠道编号：{args.channel_number}"))
+                    rows.append(("channel_number", f"阶段编号：{args.channel_number}"))
             rows.extend([("rom_version", f"ArkUI 版本：{args.rom_version}"),
                          ("build_number", f"构建号：{args.build_number or '请手动输入'}"),
                          ("jobs", f"并行任务：{args.jobs}"), ("variant", f"编译类型：{args.variant}"),
-                         ("refresh", "刷新远端构建号并采用建议值"),
-                         ("prepare", "准备所选目标的依赖（不编译）"),
-                         ("start", "检查配置并开始编译"), ("cancel", "退出")])
+                         ("refresh", "刷新构建号：从远端获取建议值"),
+                         ("prepare", "准备依赖：同步所选目标的依赖"),
+                         ("start", "开始编译：检查并确认 →"), ("cancel", "退出")])
             active = min(active, len(rows) - 1)
-            draw([text for _, text in rows], active)
-            key = screen.get_wch()
+            sections = {i: {"targets": "01  编译目标", "release_type": "02  发行信息",
+                            "jobs": "03  构建选项", "refresh": "04  操作"}[field]
+                        for i, (field, _) in enumerate(rows)
+                        if field in ("targets", "release_type", "jobs", "refresh")}
+            ui.draw([text for _, text in rows], active, sections=sections, align_values=True,
+                    subtitle=preview_name(), status=status, status_error=status_error,
+                    preview=preview(hints[rows[active][0]]))
+            key = ui.read_key()
             if key in ("q", "\x1b"):
                 return None
             if key in (curses.KEY_UP, curses.KEY_DOWN):
@@ -426,6 +657,8 @@ def interactive_configure(source, targets, args):
             step = -1 if key == curses.KEY_LEFT else 1
             if key not in (curses.KEY_LEFT, curses.KEY_RIGHT, " ") and not enter:
                 continue
+            if status_error:
+                status, status_error = "", False
             if field == "targets":
                 pick_targets()
             elif field in ("release_type", "channel", "variant"):
@@ -444,6 +677,7 @@ def interactive_configure(source, targets, args):
                     if field in ("jobs", "channel_number"):
                         if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= MAX_CHANNEL_NUMBER:
                             status = f"请输入 1–{MAX_CHANNEL_NUMBER} 的整数"
+                            status_error = True
                             continue
                         value = int(value)
                     setattr(args, field, value)
@@ -452,6 +686,7 @@ def interactive_configure(source, targets, args):
             elif field in ("start", "prepare") and enter:
                 if not chosen:
                     status = "请至少选择一个目标"
+                    status_error = True
                     continue
                 selected = [targets[i] for i in sorted(chosen)]
                 if field == "prepare":
@@ -464,14 +699,32 @@ def interactive_configure(source, targets, args):
                             raise BuildError("所选目标缺少依赖，请先选择“准备依赖”")
                 except BuildError as error:
                     status = str(error)
+                    status_error = True
                     continue
-                summary = [build_name(args), "目标：" + ", ".join(t["id"] for t in selected),
-                           f"类型：{args.variant}；并行任务：{args.jobs}", "Enter 确认开始；其他键返回修改"]
-                draw(summary)
-                if screen.get_wch() in ("\n", "\r", curses.KEY_ENTER):
-                    args.interactive_configured = True
-                    args.confirmed_at = utc_now()
-                    return selected
+                summary = [f"发行类型：{args.release_type}",
+                           f"更新渠道：{channel_label(args.channel, args.channel_number)}",
+                           f"ArkUI 版本：{args.rom_version}", f"构建号：{args.build_number}",
+                           f"编译类型：{args.variant}", f"并行任务：{args.jobs}", "",
+                           *[f"{i + 1:02d}  {target['name']}" for i, target in enumerate(selected)]]
+                review_offset = 0
+                while True:
+                    ui.draw(summary, active=None, title="确认开始编译", subtitle=preview_name(),
+                            footer="↑↓ 滚动查看  Enter 开始编译  Esc 返回修改",
+                            status="确认后将按目标列表顺序编译。",
+                            preview=preview("检查发行信息和目标列表。按 Enter 开始，按 Esc 返回修改。"),
+                            short_footer="↑↓ 滚动  Enter 开始  Esc 返回", scroll_offset=review_offset)
+                    review_offset = min(review_offset, ui.scroll_limit)
+                    key = ui.read_key()
+                    if key in ("\n", "\r", curses.KEY_ENTER):
+                        args.interactive_configured = True
+                        args.confirmed_at = utc_now()
+                        return selected
+                    if key == curses.KEY_UP:
+                        review_offset = max(0, review_offset - 1)
+                    elif key == curses.KEY_DOWN:
+                        review_offset = min(ui.scroll_limit, review_offset + 1)
+                    elif key != curses.KEY_RESIZE:
+                        break
             elif field == "cancel" and enter:
                 return None
 
