@@ -179,15 +179,12 @@ def menu(source, targets):
     print("编号可多选，例如 1,2 或 1-2；all 全选；q 退出。", flush=True)
 
 
-def source_versions(source):
+def source_version(source):
     text = (source / "vendor/lineage/config/version.mk").read_text(encoding="utf-8")
-    values = {}
-    for name in ("ARKUI_VERSION", "PRODUCT_VERSION_MAJOR", "PRODUCT_VERSION_MINOR"):
-        match = re.search(rf"^{name}\s*[?:]?=\s*(\S+)\s*$", text, re.MULTILINE)
-        if not match:
-            raise BuildError(f"无法从源码读取默认版本: {name}")
-        values[name] = match[1]
-    return values["ARKUI_VERSION"], values["PRODUCT_VERSION_MAJOR"] + "." + values["PRODUCT_VERSION_MINOR"]
+    match = re.search(r"^ARKUI_VERSION\s*[?:]?=\s*(\S+)\s*$", text, re.MULTILINE)
+    if not match:
+        raise BuildError("无法从源码读取默认版本: ARKUI_VERSION")
+    return match[1]
 
 
 def valid_build_number(value):
@@ -272,7 +269,7 @@ def fetch_latest_build_number(url):
 
 
 def configure_release(source, selected, args):
-    default_version, lineage_version = source_versions(source)
+    default_version = source_version(source)
     if not args.interactive_configured and not args.yes and not args.preview:
         raise BuildError("编译前需要交互确认；自动化调用请提供完整版本参数和 --yes")
     if not args.interactive_configured:
@@ -300,14 +297,13 @@ def configure_release(source, selected, args):
     print("\n编译前确认：")
     print("  目标: " + ", ".join(target["name"] for target in selected))
     print(f"  发行名称: {build_name(args)}")
-    print(f"  基础版本 org.arkui.build.version: {lineage_version}（由源码决定）")
+    print(f"  版本属性 org.arkui.build.version: {args.rom_version}（与本次 ArkUI 版本一致）")
     print(f"  编译类型: {args.variant}\n  并行任务: {args.jobs}")
     if args.preview:
         print("仅预览，未确认或启动编译。")
         return False
     if not args.interactive_configured:
         args.confirmed_at = utc_now()
-    args.expected_lineage_version = lineage_version
     return True
 
 
@@ -318,7 +314,7 @@ def interactive_configure(source, targets, args):
         raise BuildError("当前 Python 缺少 curses，请使用 Ubuntu 的系统 Python 运行键盘菜单") from error
 
     args.release_type = args.release_type or "OFFICIAL"
-    args.rom_version = args.rom_version or source_versions(source)[0]
+    args.rom_version = args.rom_version or source_version(source)
     if args.release_type == "OFFICIAL":
         args.channel = args.channel or "beta"
         if args.channel != "stable" and args.channel_number is None:
@@ -663,7 +659,7 @@ def package(source, stage, target, variables, env, args):
         raise BuildError("实际渠道编号不符合选择")
     for key, expected_value in {
         "ro.arkui.version": args.rom_version,
-        "org.arkui.build.version": args.expected_lineage_version,
+        "org.arkui.build.version": args.rom_version,
         "ro.build.version.incremental": args.build_number,
     }.items():
         if props.get(key) != expected_value:
@@ -834,7 +830,7 @@ def build_one(source, artifacts_root, target, args, catalog):
                 "confirmed_settings": {"release_type": args.release_type, "release_channel": args.channel,
                                        "release_channel_number": args.channel_number,
                                        "rom_version": args.rom_version,
-                                       "build_number": args.build_number, "base_version": args.expected_lineage_version},
+                                       "build_number": args.build_number, "base_version": args.rom_version},
             })
             write_json(stage / "release.json", release_manifest(
                 target, variables, props, files, "dirty" if dirty else "clean", release_id))
